@@ -1,0 +1,29 @@
+Subject: [PATCH] player: use pure black background instead of theme surface color
+
+The player root container painted the Material3 ColorScheme `background`
+(#141218 in the dark scheme) behind the video surface. The video is a
+proportionally centered SurfaceView, so on displays wider than 16:9
+(3:2, 16:10, ...) the uncovered area showed this dark gray-blue band
+instead of pure black, which reads as a glowing gray letterbox bar.
+
+The sampled pixels of the official build confirm it:
+  letterbox bar : rgb(20, 17, 24)
+  real video black : rgb(0, 0, 0)
+
+So this is not a limited/full range mismatch - the app simply drew a
+non-black background.
+
+Compose Color is an inline value class storing 0xAARRGGBB in the upper
+32 bits of a long, so opaque black is 0xff00000000000000L.
+
+--- a/smali/e47.smali
++++ b/smali/e47.smali
+@@ -14142,7 +14142,7 @@
+     move/from16 p6, v2
+ 
+     .line 86
+-    iget-wide v1, v4, Lty0;->E:J
++    const-wide v1, 0xff00000000000000L
+ 
+     .line 87
+     sget-object v4, Lgn3;->J0:Lt83;
