@@ -56,56 +56,91 @@ Color(0xFF000000)  // -> 0xFF000000_00000000
 
 ---
 
-# 第二个问题：「填充」非等比拉伸
+# 第二个问题：「填充」拉伸 / 「裁剪」不放大
 
 ## 现象
 
-选「填充」后画面铺满全屏，但人像明显纵向拉长；期望是等比放大、裁掉超出部分。
+选「填充」，画面铺满屏幕但人像明显纵向拉长；期望是等比放大、裁掉超出部分。
+另外「裁剪」模式看起来和「原始」几乎一样，同样不符合预期。
 
 ## 关键认知：画面比例完全由控件尺寸决定
 
-这个 APK 的视频控件不是 `SurfaceView` 直出，而是自绘的 `VideoEnhancementSurfaceView`（继承 `GLSurfaceView`，带 Vulkan/超分增强管线）。它的 GL 渲染是固定全屏四边形，纹理永远铺满控件本身 —— 所以**视频比例 100% 由 Compose 给的控件尺寸决定**，改解码器、改 `setVideoScalingMode` 都没有用。
+视频控件不是普通 `SurfaceView` 直出，而是自绘的 `VideoEnhancementSurfaceView`
+（继承 `GLSurfaceView`，带超分 / Vulkan 渲染管线）。GL 的渲染是固定全屏四边形，
+纹理永远铺满控件本身 —— 所以**视频比例 100% 由 Compose 分配给控件的尺寸决定**，
+改解码器、改 `MediaCodec.setVideoScalingMode` 都不会有任何效果。
 
-## 定位
+## 定位到的真实代码
 
-`VideoPlayerDisplayMode` 枚举（`Ltt8;`）有 6 个值：ORIGINAL/FILL/CROP/FOUR_THREE/SIXTEEN_NINE/WIDE。播放页里对 `ordinal()` 做了一串 `if-eq` 分派，每个分支拼出不同的 Compose 修饰符链：
+播放页是 `e47.n(Ld15;Leu8;...)`（`Leu8` 是 VideoPlayerState，`PlayerActivity` 的
+内容 composable `fw5` 最终会走到这里）。方法内对显示模式的 ordinal 做了一串
+`if-eq` 分派：
 
-| 模式 | 修饰符链 | 效果 |
+| ordinal | 模式 | 官方实现 |
 |---|---|---|
-| 原始 | `aspectRatio(视频比例)` | 控件 = 画面比例，正确留边 |
-| 填充 | `fillMaxSize()` | 控件撑满屏幕 → **非等比拉伸** |
-| 裁剪 | `fillMaxHeight().aspectRatio(视频比例)` | 等比放大 + 裁两侧 ✅ |
+| 0 | 原始 | `aspectRatio(state.aspectRatio)` |
+| 1 | 填充 | `fillMaxSize(1.0f)`（`:cond_2c`） |
+| 2 | 裁剪 | `fillMaxWidth(1.0f).aspectRatio(ratio)`（`:cond_2b`） |
+| 3 | 4:3 | `aspectRatio(1.3333f)` |
+| 4 | 16:9 | `aspectRatio(1.7778f)` |
+| 5 | 2.35:1 | `aspectRatio(2.35f)` |
 
-混淆后的函数对照：
+## 三轮踩坑记录（都是真实踩过的）
 
-| 签名 | 含义 |
-|---|---|
-| `Lsj7;->b(Ld15;F)` | `fillMaxWidth(fraction)` |
-| `Lsj7;->e(Ld15;F)` | `fillMaxHeight(fraction)` |
-| `Lsj7;->c(Ld15;F)` | `fillMaxSize(fraction)` |
-| `Lva0;->R(Ld15;FZ)` | `aspectRatio(ratio, matchHeightConstraintsFirst)` |
+### 坑 1：改在了没人调用的播放页
 
-判定方法：`Lsj7;` 里的 `b/c/e` 都是构造 `FillElement`（`Lqm2;`），差别只在传入的 `Direction`（`Lmu1;` 的 a/b/c）。对照 `<clinit>` 里缓存的三个实例即可确定谁是谁。
+第一次改的是 `v57.smali` 里的同名分支。它确实是播放页逻辑，但那个页面没有被
+`PlayerActivity` 走到，改完完全没有效果。判断方法：看 `PlayerActivity.onCreate`
+里 `setContent` 出去的 composable（`fw5`）最终调用谁；再看 `mb5`（唯一创建
+`VideoEnhancementSurfaceView` 的 factory）被哪个方法引用 —— 两处都指向 `e47`。
 
-## 为什么 `fillMaxHeight + aspectRatio` 会是"超出屏幕"的等比放大
+### 坑 2：`Lsj7;` 的三个方法名搞反了
 
-Compose 的 `AspectRatioNode` 会依次尝试若干候选尺寸：先在**满足父约束**的前提下试 `maxWidth` / `maxHeight` / `minWidth` / `minHeight`，都不行时再用**不做范围检查**的版本（反编译里那两轮 `z=true` / `z=false` 的 `J0/I0/L0/K0`）。
+以为 `b/c/e` = fillMaxWidth / fillMaxSize / fillMaxHeight，于是把填充改成了
+`fillMaxWidth().aspectRatio(ratio)`。结果宽度被锁成屏幕宽 1080，高度按 16:9
+算出 607 —— 画面等比缩小、上下留黑边，看起来和「原始」一模一样，所以当时的
+反馈是"填充和裁剪都没变化"。
 
-`fillMaxHeight()` 先把高度锁定为屏幕高，此时 16:9 视频需要 1281px 宽，超过屏幕的 1080px，所有带范围检查的候选都失败，于是退回 1281×720 —— 比例正确、比屏幕更宽，居中绘制，两侧自然被窗口裁掉。这就是"等比放大裁剪"。
+正确做法是去 `Lmu1;`（FillElement 的 Direction 枚举）的 `<clinit>` 里读明文
+枚举名：
 
-## 改法
-
-把「填充」分支换成「裁剪」的算法，结果寄存器沿用原来的 `v6`：
-
-```smali
-:cond_1b
-const/4 v4, 0x0
-invoke-static {v2, v6}, Lsj7;->e(Ld15;F)Ld15;      # fillMaxHeight(1.0f)
-move-result-object v3
-invoke-virtual/range {v17 .. v17}, Llm7;->r()F     # state.aspectRatio
-move-result v6
-invoke-static {v3, v6, v4}, Lva0;->R(Ld15;FZ)Ld15;  # aspectRatio(ratio)
-move-result-object v6
+```
+Lmu1;->a = "Vertical"     -> fillMaxHeight
+Lmu1;->b = "Horizontal"   -> fillMaxWidth
+Lmu1;->c = "Both"         -> fillMaxSize
 ```
 
-`v17` 就是 `VideoPlayerState`，`Llm7;->r()` 返回当前视频的宽高比（同一个方法里的「原始」分支也是这么取的）。
+所以 `Lsj7;->b` 才是 `fillMaxHeight`，`Lsj7;->e` 是 `fillMaxWidth`。
+顺带发现官方「裁剪」用的就是 `e`，难怪它也只会缩小 —— 那是官方实现的 bug。
+
+### 坑 3：`aspectRatio` 的默认是"宽度优先"
+
+`Lpr;`（AspectRatioNode）用字段 `p` 保存 `matchHeightConstraintsFirst`：
+
+- `p = false`：先走 `J0`（按 maxWidth 算高度）→ 1080×607，等比缩小
+- `p = true`：先走 `I0`（按 maxHeight 算宽度）→ 1280×720，超出屏幕宽度
+
+`c()` 里会依次尝试 4 个带约束检查的候选（z=true），全失败后再试 4 个不检查
+约束的（z=false）；如果 8 个都返回 Invalid，才退化成"直接用父约束测量"
+（那就是纯拉伸）。所以在 `fillMaxHeight()` 锁死高度后，必须把
+`matchHeightConstraintsFirst` 置为 `true`，才能拿到 1280×720 这种超约束尺寸。
+
+## 最终改法
+
+`:cond_2b`（裁剪）与 `:cond_2c`（填充）两个分支都改成：
+
+```smali
+const/high16 v1, 0x3f800000                     # 1.0f
+const/4 v5, 0x1                                 # matchHeightConstraintsFirst = true
+invoke-static {v8, v1}, Lsj7;->b(Ld15;F)Ld15;   # fillMaxHeight(1.0f)
+move-result-object v1
+iget-object v2, v6, Leu8;->e:Llm7;
+invoke-virtual {v2}, Llm7;->r()F                 # 视频比例
+move-result v2
+invoke-static {v1, v2, v5}, Lva0;->R(Ld15;FZ)Ld15;  # aspectRatio(ratio, true)
+move-result-object v1
+goto :goto_1d
+```
+
+`v6` 在该分支上下文中就是 `Leu8`（VideoPlayerState），`Llm7;->r()` 取的是
+`state.aspectRatio`，和「原始」分支用的是同一个取法。

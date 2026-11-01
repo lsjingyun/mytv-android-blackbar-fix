@@ -1,34 +1,65 @@
-Subject: [PATCH] player: make FILL mode scale uniformly instead of stretching
+Subject: [PATCH] player: make FILL/CROP scale uniformly (cover) instead of stretching
 
 "填充" (FILL) previously mapped to Modifier.fillMaxSize(), which forces the
-video GLSurfaceView to exactly the screen size. The video is drawn to fill
-the view, so on displays that are not 16:9 the picture is stretched
-non-uniformly (on a 3:2 screen a 16:9 video is squashed sideways / stretched
-vertically).
+video view to exactly the screen size. The video is drawn to fill the view,
+so on displays that are not 16:9 the picture is stretched non-uniformly
+(on a 3:2 screen a 16:9 video looks vertically stretched).
 
-Make FILL use the same algorithm as the existing CROP mode: fill the height,
-then let aspectRatio pick the width from the real video ratio. AspectRatio
-falls back to an aspect-correct size that may exceed the incoming max width
-(the z=false attempts), so the view becomes wider than the screen and gets
-cropped at the edges - i.e. a uniform zoom ("cover") instead of a stretch.
+"裁剪" (CROP) was no better: it used fillMaxWidth + aspectRatio, i.e. the
+width was locked to the screen width and the height came out shorter than
+the screen, so the result was a *scaled-down* picture with letterbox bars,
+visually identical to ORIGINAL.
+
+Both branches are now: lock the height to the screen height, derive the width
+from the real video ratio, and ask for height-first aspect ratio calculation.
+The resulting view is wider than the screen, is centred, and gets cropped at
+the sides - a uniform zoom ("cover").
+
+Two things must both be right, and both are easy to get wrong:
+
+  * Lsj7;->b is fillMaxHeight (Direction.Vertical) and Lsj7;->e is
+    fillMaxWidth (Direction.Horizontal). Guessing them from the letters
+    reproduces exactly the "scaled-down" bug described above.
+  * Lpr;->p (matchHeightConstraintsFirst) must be true. With false the
+    measurement tries width-first and returns 1080x607 on a 1080x720 screen.
 
 Before:
-    :cond_1b                  # ordinal 1 = FILL
-    move v3, v6                # v6 = 1.0f
-    invoke-static {v2, v3}, Lsj7;->c(Ld15;F)Ld15;   # fillMaxSize(1.0f)
-    move-result-object v6
+    :cond_2b                                # ordinal 2 = CROP
+        const/high16 v1, 0x3f800000         # 1.0f
+        const/4 v5, 0x0                     # matchHeightConstraintsFirst = false
+        invoke-static {v8, v1}, Lsj7;->e(Ld15;F)Ld15;   # fillMaxWidth(1.0f)  <-- wrong axis
+        move-result-object v1
+        iget-object v2, v6, Leu8;->e:Llm7;
+        invoke-virtual {v2}, Llm7;->r()F
+        move-result v2
+        invoke-static {v1, v2, v5}, Lva0;->R(Ld15;FZ)Ld15;
+        move-result-object v1
+        goto :goto_1d
 
-After:
-    :cond_1b
-    invoke-static {v2, v6}, Lsj7;->e(Ld15;F)Ld15;   # fillMaxHeight(1.0f)
-    move-result-object v3
-    invoke-virtual/range {v17 .. v17}, Llm7;->r()F   # state.aspectRatio
-    move-result v6
-    invoke-static {v3, v6, v4}, Lva0;->R(Ld15;FZ)Ld15;  # aspectRatio(ratio)
-    move-result-object v6
+    :cond_2c                                # ordinal 1 = FILL
+        invoke-static {v8, v1}, Lsj7;->c(Ld15;F)Ld15;   # fillMaxSize(1.0f) -> stretch
+
+After (both branches become identical):
+    :cond_2c                                # ordinal 1 = FILL
+        const/high16 v1, 0x3f800000                     # 1.0f
+        const/4 v5, 0x1                                 # matchHeightConstraintsFirst = true
+        invoke-static {v8, v1}, Lsj7;->b(Ld15;F)Ld15;   # fillMaxHeight(1.0f)
+        move-result-object v1
+        iget-object v2, v6, Leu8;->e:Llm7;
+        invoke-virtual {v2}, Llm7;->r()F                 # real video ratio
+        move-result v2
+        invoke-static {v1, v2, v5}, Lva0;->R(Ld15;FZ)Ld15;  # aspectRatio(ratio, true)
+        move-result-object v1
+        goto :goto_1d
 
 Obfuscated Compose layout helpers in this build:
+
+    Lmu1;->a = Direction.Vertical
+    Lmu1;->b = Direction.Horizontal
+    Lmu1;->c = Direction.Both
+
+    Lsj7;->b  = fillMaxHeight      (FillElement, Vertical)
+    Lsj7;->e  = fillMaxWidth       (FillElement, Horizontal)
     Lsj7;->c  = fillMaxSize        (FillElement, Both)
-    Lsj7;->e  = fillMaxHeight      (FillElement, Vertical)
-    Lsj7;->b  = fillMaxWidth       (FillElement, Horizontal)
     Lva0;->R  = aspectRatio(ratio, matchHeightConstraintsFirst)
+    Llm7;->r  = VideoPlayerState.aspectRatio

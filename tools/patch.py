@@ -43,62 +43,93 @@ def run(cmd, **kw):
     subprocess.run(cmd, check=True, **kw)
 
 
-def patch_fill_mode(decoded, work):
-    """Turn the FILL display mode from fillMaxSize (stretch) into
-    fillMaxHeight().aspectRatio(videoRatio) (uniform zoom / cover)."""
-    pattern = re.compile(
-        r"(?P<label>    :\w+)\n"
-        r"    move (?P<a>v\d+), (?P<b>v\d+)\n"
-        r"\n"
-        r"    \.line \d+\n"
-        r"    const/4 (?P<c>v\d+), 0x0\n"
-        r"\n"
-        r"    \.line \d+\n"
-        r"    invoke-static \{(?P<recv>v\d+), (?P=a)\}, Lsj7;->c\(Ld15;F\)Ld15;"
-    )
-    state_re = re.compile(r"invoke-virtual/range \{v(\d+) \.\. v\1\}, Llm7;->r\(\)F")
+def _block_bounds(lines, label):
+    start = next(i for i, l in enumerate(lines) if l.strip() == label)
+    end = start + 1
+    while end < len(lines):
+        s = lines[end].strip()
+        if s.startswith("goto "):
+            end += 1
+            break
+        if s.startswith(":") and end > start + 1:
+            break
+        end += 1
+    return start, end
 
+
+def _normalise_branch(lines, label):
+    """Make one display-mode branch scale uniformly (cover).
+
+    Two separate mistakes live in these branches in the stock build:
+      * CROP used Lsj7;->e, which is fillMaxWidth (Direction.Horizontal),
+        not fillMaxHeight - so it only ever shrank the picture.
+      * matchHeightConstraintsFirst was false, so aspectRatio measured
+        width-first and returned 1080x607 on a 1080x720 screen.
+
+    v5 is the flag register used by this branch in 235; v6 holds
+    VideoPlayerState (Leu8).
+    """
+    a, b = _block_bounds(lines, label)
+    changed = 0
+    for i in range(a, b):
+        l = lines[i]
+        if "Lsj7;->c(Ld15;F)Ld15;" in l or "Lsj7;->e(Ld15;F)Ld15;" in l:
+            lines[i] = l.replace("Lsj7;->c(", "Lsj7;->b(").replace(
+                "Lsj7;->e(", "Lsj7;->b("
+            )
+            changed += 1
+        elif re.match(r"\s+const/4 v\d+, 0x0\s*$", l):
+            lines[i] = re.sub(r"0x0\s*$", "0x1", l)
+            changed += 1
+
+    if not any("Lva0;->R(Ld15;FZ)Ld15;" in x for x in lines[a:b]):
+        mr = next(
+            (i for i in range(a, b) if lines[i].strip().startswith("move-result-object")),
+            None,
+        )
+        if mr is None:
+            return changed
+        res = lines[mr].strip().split()[-1]
+        lines[mr + 1 : mr + 1] = [
+            "\n",
+            "    iget-object v2, v6, Leu8;->e:Llm7;\n",
+            "\n",
+            "    invoke-virtual {v2}, Llm7;->r()F\n",
+            "\n",
+            "    move-result v2\n",
+            "\n",
+            "    invoke-static {%s, v2, v5}, Lva0;->R(Ld15;FZ)Ld15;\n" % res,
+            "\n",
+            "    move-result-object %s\n" % res,
+        ]
+        changed += 1
+    return changed
+
+
+def patch_fill_mode(decoded, work):
+    """FILL: fillMaxSize (stretch) -> fillMaxHeight + aspectRatio (cover).
+    CROP: fillMaxWidth -> fillMaxHeight (it used to only shrink)."""
     for root, _, files in os.walk(decoded):
         for name in files:
             if not name.endswith(".smali"):
                 continue
             path = os.path.join(root, name)
             src = open(path).read()
-            if "Ltt8;" not in src:
+            if "Ltt8;" not in src or ":cond_2c" not in src:
                 continue
-            hits = list(pattern.finditer(src))
-            if len(hits) != 1:
-                continue
-            state = state_re.search(src)
-            if not state:
-                continue
-            m = hits[0]
-            st = state.group(1)
-            repl = (
-                f"{m.group('label')}\n"
-                f"    const/4 {m.group('c')}, 0x0\n"
-                f"\n"
-                f"    .line 1\n"
-                f"    invoke-static {{{m.group('recv')}, {m.group('b')}}}, "
-                f"Lsj7;->e(Ld15;F)Ld15;\n"
-                f"\n"
-                f"    .line 2\n"
-                f"    move-result-object {m.group('a')}\n"
-                f"\n"
-                f"    .line 3\n"
-                f"    invoke-virtual/range {{v{st} .. v{st}}}, Llm7;->r()F\n"
-                f"\n"
-                f"    .line 4\n"
-                f"    move-result {m.group('b')}\n"
-                f"\n"
-                f"    .line 5\n"
-                f"    invoke-static {{{m.group('a')}, {m.group('b')}, {m.group('c')}}}, "
-                f"Lva0;->R(Ld15;FZ)Ld15;"
+
+            lines = src.splitlines(True)
+            n = _normalise_branch(lines, ":cond_2b") + _normalise_branch(
+                lines, ":cond_2c"
             )
-            src = src[: m.start()] + repl + src[m.end() :]
-            open(path, "w").write(src)
-            print("patched FILL mode in %s" % os.path.relpath(path, work))
-            return
+            out = "".join(lines)
+            if out != src:
+                open(path, "w").write(out)
+                print(
+                    "patched FILL/CROP mode in %s (%d edits)"
+                    % (os.path.relpath(path, work), n)
+                )
+                return
     sys.exit("FILL display-mode branch not found - different version?")
 
 

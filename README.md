@@ -51,36 +51,50 @@ Compose 的 `Color` 是内联值类，`0xAARRGGBB` 存在 long 的高 32 位，�
 
 ### 根因
 
-视频控件是自绘的 `GLSurfaceView`，纹理永远铺满控件本身，所以**画面比例完全由 Compose 给的控件尺寸决定**：
+视频控件是自绘的 `GLSurfaceView`（`VideoEnhancementSurfaceView`），纹理永远铺满控件本身，所以**画面比例完全由 Compose 给的控件尺寸决定**：
 
-- `原始`（ORIGINAL）= `aspectRatio(视频比例)` → 控件等于画面比例，正确留黑边
-- `填充`（FILL）= `fillMaxSize()` → 控件被撑成屏幕尺寸，画面非等比拉伸 ← 问题所在
-- `裁剪`（CROP）= `fillMaxHeight().aspectRatio(视频比例)` → 等比放大裁剪，本来就是正确算法
+| 模式 | 官方实现 | 实际效果 |
+|---|---|---|
+| 原始（ORIGINAL） | `aspectRatio(视频比例)` | 控件等于画面比例，正确留边 |
+| 填充（FILL） | `fillMaxSize()` | 控件撑满屏幕 → **非等比拉伸** ← 问题所在 |
+| 裁剪（CROP） | `fillMaxWidth().aspectRatio(视频比例)` | 宽度锁屏宽、高度按比例算出 → **等比缩小**，并没有放大 |
+
+注意「裁剪」用的其实是 `fillMaxWidth`：宽度被锁成屏幕宽，高度按比例算出来比屏幕矮，结果是画面等比缩小、上下留边，看起来和「原始」几乎没区别。这是官方自己的实现问题，不是配置问题。
 
 ### 改法
 
-把「填充」的分支改成「裁剪」的算法（撑满高度 + 按视频比例算宽度）。Compose 的 `aspectRatio` 在所有满足约束的尺寸都不可行时，会退回"比例正确但超出父约束"的尺寸，于是控件比屏幕更宽、两侧被裁掉 —— 正是等比放大（cover）：
+两个分支（填充 `:cond_2c`、裁剪 `:cond_2b`）都改成「锁定屏幕高度 → 按视频比例算宽度 → 宽度超出屏幕的部分由父级裁掉」，并把 `matchHeightConstraintsFirst` 置为 `true` 让宽高比按高度优先计算：
 
 ```smali
-# 修改前
-invoke-static {v2, v3}, Lsj7;->c(Ld15;F)Ld15;      # fillMaxSize(1.0f)
-
-# 修改后
-invoke-static {v2, v6}, Lsj7;->e(Ld15;F)Ld15;      # fillMaxHeight(1.0f)
-move-result-object v3
-invoke-virtual {v17}, Llm7;->r()F                   # state.aspectRatio
-move-result v6
-invoke-static {v3, v6, v4}, Lva0;->R(Ld15;FZ)Ld15;  # aspectRatio(ratio)
+:cond_2c                                             # 填充分支
+const/high16 v1, 0x3f800000                          # 1.0f
+const/4 v5, 0x1                                      # matchHeightConstraintsFirst = true
+invoke-static {v8, v1}, Lsj7;->b(Ld15;F)Ld15;        # fillMaxHeight(1.0f)
+move-result-object v1
+iget-object v2, v6, Leu8;->e:Llm7;
+invoke-virtual {v2}, Llm7;->r()F                     # 视频真实宽高比
+move-result v2
+invoke-static {v1, v2, v5}, Lva0;->R(Ld15;FZ)Ld15;   # aspectRatio(ratio, true)
+move-result-object v1
 ```
 
-这份 APK 里混淆后的 Compose 布局函数对照（方便自己继续改）：
+为什么必须两个条件同时满足：
+
+- `aspectRatio` 的测量类（`Lpr;`）用字段 `p` 保存 `matchHeightConstraintsFirst`。`p = false` 时先按**宽度**算（1080×607，等比缩小），`p = true` 时才先按**高度**算（1280×720，超出屏幕宽度）。
+- 高度锁定后，1280 宽超出父约束，带约束检查的候选尺寸全部失败，于是回退到"不检查约束"的结果 → 得到 1280×720 的控件，居中摆放、两侧被窗口裁掉 —— 这才是 cover。
+
+### 混淆对照（容易搞反）
+
+`FillElement` 的方向枚举是 `Lmu1;`，静态初始化里能看到明文枚举名：`a` = `Vertical`、`b` = `Horizontal`、`c` = `Both`。所以：
 
 | 混淆签名 | 真实含义 |
 |---|---|
-| `Lsj7;->b(Ld15;F)` | `fillMaxWidth(fraction)` |
-| `Lsj7;->e(Ld15;F)` | `fillMaxHeight(fraction)` |
-| `Lsj7;->c(Ld15;F)` | `fillMaxSize(fraction)` |
+| `Lsj7;->b(Ld15;F)` | `fillMaxHeight(fraction)` ← Vertical |
+| `Lsj7;->e(Ld15;F)` | `fillMaxWidth(fraction)` ← Horizontal |
+| `Lsj7;->c(Ld15;F)` | `fillMaxSize(fraction)` ← Both |
 | `Lva0;->R(Ld15;FZ)` | `aspectRatio(ratio, matchHeightConstraintsFirst)` |
+
+> 只看方法名 `b/c/e` 猜不出谁是谁，必须对照 `Lmu1;` 的 `<clinit>`，否则很容易把 `e`（fillMaxWidth）当成 fillMaxHeight，改完只会得到"等比缩小"。
 
 ## 补丁文件
 
@@ -103,7 +117,7 @@ mytv-android-tv-3.0.0.235-all-sdk23-blackbar-black.apk
 SHA-256：
 
 ```
-c11037a2624cd6149e599c29bb0400ae8033f8ad931b9b1b7bd23c9dc1a1ad1a
+f935c2bebf61ed95f24c35d3b87400854209f7229b8662424e30eb6d4e20ba57
 ```
 
 ## 安装（重要）
