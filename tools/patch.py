@@ -43,6 +43,65 @@ def run(cmd, **kw):
     subprocess.run(cmd, check=True, **kw)
 
 
+def patch_fill_mode(decoded, work):
+    """Turn the FILL display mode from fillMaxSize (stretch) into
+    fillMaxHeight().aspectRatio(videoRatio) (uniform zoom / cover)."""
+    pattern = re.compile(
+        r"(?P<label>    :\w+)\n"
+        r"    move (?P<a>v\d+), (?P<b>v\d+)\n"
+        r"\n"
+        r"    \.line \d+\n"
+        r"    const/4 (?P<c>v\d+), 0x0\n"
+        r"\n"
+        r"    \.line \d+\n"
+        r"    invoke-static \{(?P<recv>v\d+), (?P=a)\}, Lsj7;->c\(Ld15;F\)Ld15;"
+    )
+    state_re = re.compile(r"invoke-virtual/range \{v(\d+) \.\. v\1\}, Llm7;->r\(\)F")
+
+    for root, _, files in os.walk(decoded):
+        for name in files:
+            if not name.endswith(".smali"):
+                continue
+            path = os.path.join(root, name)
+            src = open(path).read()
+            if "Ltt8;" not in src:
+                continue
+            hits = list(pattern.finditer(src))
+            if len(hits) != 1:
+                continue
+            state = state_re.search(src)
+            if not state:
+                continue
+            m = hits[0]
+            st = state.group(1)
+            repl = (
+                f"{m.group('label')}\n"
+                f"    const/4 {m.group('c')}, 0x0\n"
+                f"\n"
+                f"    .line 1\n"
+                f"    invoke-static {{{m.group('recv')}, {m.group('b')}}}, "
+                f"Lsj7;->e(Ld15;F)Ld15;\n"
+                f"\n"
+                f"    .line 2\n"
+                f"    move-result-object {m.group('a')}\n"
+                f"\n"
+                f"    .line 3\n"
+                f"    invoke-virtual/range {{v{st} .. v{st}}}, Llm7;->r()F\n"
+                f"\n"
+                f"    .line 4\n"
+                f"    move-result {m.group('b')}\n"
+                f"\n"
+                f"    .line 5\n"
+                f"    invoke-static {{{m.group('a')}, {m.group('b')}, {m.group('c')}}}, "
+                f"Lva0;->R(Ld15;FZ)Ld15;"
+            )
+            src = src[: m.start()] + repl + src[m.end() :]
+            open(path, "w").write(src)
+            print("patched FILL mode in %s" % os.path.relpath(path, work))
+            return
+    sys.exit("FILL display-mode branch not found - different version?")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("apk")
@@ -95,6 +154,9 @@ def main():
     with open(target, "w") as fh:
         fh.writelines(lines)
     print("patched %s:%d" % (os.path.relpath(target, work), idx + 1))
+
+    # 2b. FILL display mode: fillMaxSize -> fillMaxHeight + aspectRatio(video)
+    patch_fill_mode(decoded, work)
 
     # 3. rebuild
     unsigned = os.path.join(work, "unsigned.apk")

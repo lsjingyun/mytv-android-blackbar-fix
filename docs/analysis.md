@@ -53,3 +53,59 @@ Color(0xFF000000)  // -> 0xFF000000_00000000
 - 回编译产物中确认替换指令已存在，且没有误伤其它 `background` 调用点
 
 > 说明：官方 `main` 分支目前只保留 README（源码已转入内部私有分支），所以只能走"反编译官方 APK"的路线。上游开源代码 `feature/ui` 分支的 `VideoPlayerScreen.kt` 里，视频确实是按比例居中放置的 `SurfaceView`，四周露出的是 Compose 背景，与上述结论一致。
+
+---
+
+# 第二个问题：「填充」非等比拉伸
+
+## 现象
+
+选「填充」后画面铺满全屏，但人像明显纵向拉长；期望是等比放大、裁掉超出部分。
+
+## 关键认知：画面比例完全由控件尺寸决定
+
+这个 APK 的视频控件不是 `SurfaceView` 直出，而是自绘的 `VideoEnhancementSurfaceView`（继承 `GLSurfaceView`，带 Vulkan/超分增强管线）。它的 GL 渲染是固定全屏四边形，纹理永远铺满控件本身 —— 所以**视频比例 100% 由 Compose 给的控件尺寸决定**，改解码器、改 `setVideoScalingMode` 都没有用。
+
+## 定位
+
+`VideoPlayerDisplayMode` 枚举（`Ltt8;`）有 6 个值：ORIGINAL/FILL/CROP/FOUR_THREE/SIXTEEN_NINE/WIDE。播放页里对 `ordinal()` 做了一串 `if-eq` 分派，每个分支拼出不同的 Compose 修饰符链：
+
+| 模式 | 修饰符链 | 效果 |
+|---|---|---|
+| 原始 | `aspectRatio(视频比例)` | 控件 = 画面比例，正确留边 |
+| 填充 | `fillMaxSize()` | 控件撑满屏幕 → **非等比拉伸** |
+| 裁剪 | `fillMaxHeight().aspectRatio(视频比例)` | 等比放大 + 裁两侧 ✅ |
+
+混淆后的函数对照：
+
+| 签名 | 含义 |
+|---|---|
+| `Lsj7;->b(Ld15;F)` | `fillMaxWidth(fraction)` |
+| `Lsj7;->e(Ld15;F)` | `fillMaxHeight(fraction)` |
+| `Lsj7;->c(Ld15;F)` | `fillMaxSize(fraction)` |
+| `Lva0;->R(Ld15;FZ)` | `aspectRatio(ratio, matchHeightConstraintsFirst)` |
+
+判定方法：`Lsj7;` 里的 `b/c/e` 都是构造 `FillElement`（`Lqm2;`），差别只在传入的 `Direction`（`Lmu1;` 的 a/b/c）。对照 `<clinit>` 里缓存的三个实例即可确定谁是谁。
+
+## 为什么 `fillMaxHeight + aspectRatio` 会是"超出屏幕"的等比放大
+
+Compose 的 `AspectRatioNode` 会依次尝试若干候选尺寸：先在**满足父约束**的前提下试 `maxWidth` / `maxHeight` / `minWidth` / `minHeight`，都不行时再用**不做范围检查**的版本（反编译里那两轮 `z=true` / `z=false` 的 `J0/I0/L0/K0`）。
+
+`fillMaxHeight()` 先把高度锁定为屏幕高，此时 16:9 视频需要 1281px 宽，超过屏幕的 1080px，所有带范围检查的候选都失败，于是退回 1281×720 —— 比例正确、比屏幕更宽，居中绘制，两侧自然被窗口裁掉。这就是"等比放大裁剪"。
+
+## 改法
+
+把「填充」分支换成「裁剪」的算法，结果寄存器沿用原来的 `v6`：
+
+```smali
+:cond_1b
+const/4 v4, 0x0
+invoke-static {v2, v6}, Lsj7;->e(Ld15;F)Ld15;      # fillMaxHeight(1.0f)
+move-result-object v3
+invoke-virtual/range {v17 .. v17}, Llm7;->r()F     # state.aspectRatio
+move-result v6
+invoke-static {v3, v6, v4}, Lva0;->R(Ld15;FZ)Ld15;  # aspectRatio(ratio)
+move-result-object v6
+```
+
+`v17` 就是 `VideoPlayerState`，`Llm7;->r()` 返回当前视频的宽高比（同一个方法里的「原始」分支也是这么取的）。

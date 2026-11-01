@@ -1,0 +1,34 @@
+Subject: [PATCH] player: make FILL mode scale uniformly instead of stretching
+
+"填充" (FILL) previously mapped to Modifier.fillMaxSize(), which forces the
+video GLSurfaceView to exactly the screen size. The video is drawn to fill
+the view, so on displays that are not 16:9 the picture is stretched
+non-uniformly (on a 3:2 screen a 16:9 video is squashed sideways / stretched
+vertically).
+
+Make FILL use the same algorithm as the existing CROP mode: fill the height,
+then let aspectRatio pick the width from the real video ratio. AspectRatio
+falls back to an aspect-correct size that may exceed the incoming max width
+(the z=false attempts), so the view becomes wider than the screen and gets
+cropped at the edges - i.e. a uniform zoom ("cover") instead of a stretch.
+
+Before:
+    :cond_1b                  # ordinal 1 = FILL
+    move v3, v6                # v6 = 1.0f
+    invoke-static {v2, v3}, Lsj7;->c(Ld15;F)Ld15;   # fillMaxSize(1.0f)
+    move-result-object v6
+
+After:
+    :cond_1b
+    invoke-static {v2, v6}, Lsj7;->e(Ld15;F)Ld15;   # fillMaxHeight(1.0f)
+    move-result-object v3
+    invoke-virtual/range {v17 .. v17}, Llm7;->r()F   # state.aspectRatio
+    move-result v6
+    invoke-static {v3, v6, v4}, Lva0;->R(Ld15;FZ)Ld15;  # aspectRatio(ratio)
+    move-result-object v6
+
+Obfuscated Compose layout helpers in this build:
+    Lsj7;->c  = fillMaxSize        (FillElement, Both)
+    Lsj7;->e  = fillMaxHeight      (FillElement, Vertical)
+    Lsj7;->b  = fillMaxWidth       (FillElement, Horizontal)
+    Lva0;->R  = aspectRatio(ratio, matchHeightConstraintsFirst)
